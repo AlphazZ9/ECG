@@ -1,5 +1,5 @@
 """
-ECG ANALYSIS  — v5  Professional Desktop Application
+ECG ANALYSIS  — v5 
 ─────────────────────────────────────────────────────
 Install: pip install customtkinter scipy numpy pandas matplotlib neurokit2 openpyxl h5py
 Run    : python ecg_app.py
