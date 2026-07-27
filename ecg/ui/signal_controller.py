@@ -25,7 +25,7 @@ from ecg.core.detection import (
 from ecg.core.ml_detector import detect_peaks_ml, MLPeakModel
 from ecg.io.loaders import load_mat_signal
 from ecg.io.db import _DB_AVAILABLE, get_notes, get_recording
-from ecg.ui.theme import BLUE, GREEN, MUTED, ORANGE, RED, nk
+from ecg.ui.theme import BLUE, GREEN, LIGHT, MUTED, ORANGE, RED, nk
 
 if TYPE_CHECKING:
     from ecg.ui.app import ECGApp
@@ -470,6 +470,13 @@ class SignalController:
                 text="Peaks detected: — (click Preview Detection)", text_color=MUTED)
         if self.app.btn_review_art is not None:
             self.app.btn_review_art.configure(state="disabled")  # type: ignore[union-attr]
+        self.app.detection.agreement_disagree_samples = None
+        self.app.detection.agreement_summary = ""
+        if self.app.btn_check_agreement is not None:
+            self.app.btn_check_agreement.configure(state="disabled")  # type: ignore[union-attr]
+        if self.app.lbl_agreement_status is not None:
+            self.app.lbl_agreement_status.configure(  # type: ignore[union-attr]
+                text="  Not run yet", text_color=LIGHT)
 
         dur = bundle["dur_s"]
         self.app._set_status(
@@ -478,6 +485,7 @@ class SignalController:
         self.app.tabs.set("📈 Detection")
         self.app._update_ann_count()
         self.app._update_pacing_count()
+        self.app._update_topbar_filename()
         self.app.ui.nav_pos = 0.0
         self.app._sync_nav_pos_entry()
         if self.app.lbl_sig_duration is not None:

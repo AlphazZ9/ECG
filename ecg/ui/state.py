@@ -81,6 +81,10 @@ class DetectionState:
     hover_samp: Optional[int] = None            # snapped sample under cursor
     hover_samp_near: bool = False                # True = replaces nearby peak
 
+    # Cross-method agreement (detection_controller.py: check_method_agreement())
+    agreement_disagree_samples: Optional[np.ndarray] = None  # accepted peaks 0 other methods confirmed
+    agreement_summary: str = ""                  # last run's human-readable summary line
+
 
 @dataclass
 class AnalysisState:

@@ -143,11 +143,20 @@ def make_quality_gauge(
     zone_weights = [40, 30, 20, 10]  # Poor, Medium, Good, Excellent widths
     zone_colors  = [RED, AMBER, GREEN_MID, GREEN]
     total_weight = sum(zone_weights)
-    for i, (weight, color) in enumerate(zip(zone_weights, zone_colors)):
+    # Before any score exists, a fully-saturated 4-colour scale reads as
+    # meaningless decoration (a floating red/amber/green swatch next to an
+    # empty "—" caption) rather than information -- so the idle state
+    # (score=None) starts every zone in one flat muted tone instead, and
+    # _recolor_quality_zones() below paints in the real tier colours the
+    # first time a score arrives.
+    zone_frames: list[ctk.CTkFrame] = []
+    idle = score is None
+    for i, weight in enumerate(zone_weights):
         zone_w = max(1, round(track_w * weight / total_weight))
-        ctk.CTkFrame(track, fg_color=color, corner_radius=0,
-                     width=zone_w, height=track_h).pack(
-            side="left", fill="both", padx=(0 if i == 0 else 1, 0))
+        zf = ctk.CTkFrame(track, fg_color=(LIGHT if idle else zone_colors[i]),
+                           corner_radius=0, width=zone_w, height=track_h)
+        zf.pack(side="left", fill="both", padx=(0 if i == 0 else 1, 0))
+        zone_frames.append(zf)
 
     marker = ctk.CTkFrame(track, fg_color=TEXT, width=2, corner_radius=0)
     marker.place(relx=0.0, rely=0, relheight=1.0)
@@ -157,11 +166,23 @@ def make_quality_gauge(
         text_color=MUTED, anchor="w")
     score_label.pack(fill="x", pady=(2, 0))
 
-    outer.track_frame = track    # type: ignore[attr-defined]
-    outer.marker = marker        # type: ignore[attr-defined]
-    outer.score_label = score_label  # type: ignore[attr-defined]
+    outer.track_frame = track          # type: ignore[attr-defined]
+    outer.marker = marker              # type: ignore[attr-defined]
+    outer.score_label = score_label    # type: ignore[attr-defined]
+    outer.zone_frames = zone_frames    # type: ignore[attr-defined]
+    outer.zone_colors = zone_colors    # type: ignore[attr-defined]
     update_quality_gauge(outer, score)
     return outer
+
+
+def _recolor_quality_zones(gauge: ctk.CTkFrame, idle: bool) -> None:
+    """Swap the gauge's zone track between its idle grey and real tier colours."""
+    zone_frames = getattr(gauge, "zone_frames", None)
+    zone_colors = getattr(gauge, "zone_colors", None)
+    if not zone_frames or not zone_colors:
+        return
+    for zf, color in zip(zone_frames, zone_colors):
+        zf.configure(fg_color=(LIGHT if idle else color))
 
 
 def update_quality_gauge(gauge: ctk.CTkFrame, score: "Optional[int]") -> None:
@@ -171,3 +192,4 @@ def update_quality_gauge(gauge: ctk.CTkFrame, score: "Optional[int]") -> None:
     gauge.marker.place(relx=relx, rely=0, relheight=1.0)  # type: ignore[attr-defined]
     text = "—" if score is None else f"{label}  ·  {score}%"
     gauge.score_label.configure(text=text, text_color=color)  # type: ignore[attr-defined]
+    _recolor_quality_zones(gauge, idle=(score is None))

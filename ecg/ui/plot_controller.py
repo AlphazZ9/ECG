@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import matplotlib
 import matplotlib.ticker
 import matplotlib.patches
+import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
@@ -39,7 +40,7 @@ from ecg.core.analysis import compute_beat_correlation
 from ecg.ui.plots import style_axes
 from ecg.ui.wave_editor import WaveTemplateEditor
 from ecg.ui.theme import (
-    PLOT, RED, AMBER, ORANGE, ORANGE_DARK, ORANGE_DEEP,
+    PLOT, RED, AMBER, ORANGE, ORANGE_DARK,
     CYAN, BLUE, BLUE_DARK, BLUE_MID, PURPLE, TEAL, TEAL_DARK,
     BORDER2, RED_MID, MUTED, GRAY, GRAY_LIGHT, NAVY,
     GREEN, GREEN_DARK, PINK, AMBER_DARK, ARTIFACT_TYPE_COLOR,
@@ -330,6 +331,41 @@ class PlotController:
 
         _pace_snap = list(self.app.analysis.pacing_periods)
 
+        # Accepted beats that 0 other detection methods confirmed (Check
+        # Agreement, detection_controller.py) -- cleared whenever detection
+        # re-runs, so a stale set can't linger and mislabel a beat that
+        # moved.
+        _disagree = self.app.detection.agreement_disagree_samples
+        _disagree_view = (_disagree[_in_view(_disagree)]
+                           if _disagree is not None and len(_disagree) else np.array([], dtype=int))
+
+        # ── Per-accepted-peak confidence → marker alpha ─────────────────────
+        # all_candidates/all_prominences are the pre-threshold detector
+        # output (same array position/order); "prominence" is a continuous
+        # per-candidate strength score for every method (the ML detector's
+        # is a real classifier probability, see detect_peaks_ml), previously
+        # only ever used as a single global threshold cutoff. Reusing it
+        # here to fade weak-but-accepted beats lets a user spot "worth
+        # double-checking" beats directly in the trace instead of only via
+        # the pass/fail threshold slider. Purely visual -- doesn't change
+        # which peaks are accepted.
+        rp_ok_alpha = np.full(len(rp_ok), 0.95, dtype=float)
+        _cands = self.app.detection.all_candidates
+        _proms = self.app.detection.all_prominences
+        if (_cands is not None and _proms is not None
+                and len(_cands) == len(_proms) and len(_cands) and len(rp_ok)):
+            _prom_lookup = dict(zip(_cands.tolist(), _proms.tolist()))
+            _rp_proms = np.array([_prom_lookup.get(int(p), np.nan) for p in rp_ok])
+            _finite = np.isfinite(_rp_proms)
+            if _finite.sum() >= 2:
+                _lo, _hi = np.nanpercentile(_rp_proms[_finite], [5, 95])
+                if _hi > _lo:
+                    _norm = np.clip((_rp_proms - _lo) / (_hi - _lo), 0.0, 1.0)
+                    # Floor at 0.35 -- even the weakest accepted beat should
+                    # stay visible, just visually de-emphasised, not ghosted
+                    # to the point of looking like it isn't there at all.
+                    rp_ok_alpha = np.where(_finite, 0.35 + 0.60 * _norm, 0.95)
+
         primary_sig   = sig_raw   if show_raw else sig_flt
         primary_color = PLOT["raw"]      if show_raw else PLOT["filtered"]
         ghost_sig     = sig_flt   if show_raw else sig_raw
@@ -414,11 +450,24 @@ class PlotController:
                            color=RED, s=90, zorder=6,
                            marker="x", linewidths=2,
                            label=f"Excluded ({n_excl})")
-            # Accepted peaks (green dots)
+            # Accepted peaks (green dots, faded by detection confidence —
+            # see rp_ok_alpha above)
             if mask_ok.any() and sig_flt is not None:
+                _rgb = mcolors.to_rgb(PLOT["rpeak_ok"])
+                _rgba = np.tile(_rgb + (1.0,), (int(mask_ok.sum()), 1))
+                _rgba[:, 3] = rp_ok_alpha[mask_ok]
                 ax.scatter(rp_ok[mask_ok] / fs, sig_flt[rp_ok[mask_ok]],
-                           color=PLOT["rpeak_ok"], s=55, zorder=5,
+                           color=_rgba, s=55, zorder=5,
                            marker="o", label="Accepted")
+            # Cross-method disagreement ring — hollow amber ring around an
+            # accepted beat that 0 other detection methods confirmed
+            # (Check Agreement). Drawn OVER the accepted dot (zorder 5.5)
+            # so it reads as "flag on this beat", not a competing marker.
+            if len(_disagree_view) and sig_flt is not None:
+                ax.scatter(_disagree_view / fs, sig_flt[_disagree_view],
+                           s=140, zorder=5.5, marker="o",
+                           facecolors="none", edgecolors=AMBER, linewidths=1.8,
+                           label=f"Unconfirmed ({len(_disagree_view)})")
             # Manually added peaks (cyan star — rendered on top of everything)
             if mask_added.any() and sig_flt is not None:
                 ax.scatter(rp_added[mask_added] / fs, sig_flt[rp_added[mask_added]],
@@ -687,7 +736,6 @@ class PlotController:
             ("Poincaré / non-linear", lambda: self.plot_nonlinear(results)),
             ("PSD",                   lambda: self.plot_psd(results)),
             ("HRV radar",             lambda: self.plot_radar(results)),
-            ("ECG intervals ECG preview", lambda: self.plot_intervals_ecg(results)),
             ("ECG intervals",         lambda: self.plot_intervals(results)),
             ("Beat template",         lambda: self.plot_beat_template(results)),
             ("Summary",               lambda: self.plot_summary(results)),
@@ -1119,14 +1167,31 @@ class PlotController:
                 scaling="density",
             )
 
+            # Respiration-rate estimate: peak frequency within the HF band,
+            # converted breaths/min = Hz * 60. HF is labelled "respiratory"
+            # (respiratory sinus arrhythmia) but until now that was just a
+            # caption -- nk.hrv_frequency() doesn't return a peak-frequency
+            # column (confirmed empirically: HRV_HF/HRV_HFn/HRV_LFHF/... but
+            # no HRV_HF_peak), so this reads the peak directly off the PSD
+            # already computed above, the same array the HF band is shaded
+            # from, rather than adding a second spectral estimate.
+            hf_mask = (freqs >= MouseECG.HF[0]) & (freqs <= MouseECG.HF[1])
+            if hf_mask.any() and psd[hf_mask].max() > 0:
+                hf_peak_hz  = float(freqs[hf_mask][np.argmax(psd[hf_mask])])
+                resp_bpm    = hf_peak_hz * 60.0
+                hf_legend   = (f"HF   {MouseECG.HF[0]}–{MouseECG.HF[1]} Hz  "
+                               f"(resp. ≈{resp_bpm:.0f}/min)")
+            else:
+                hf_peak_hz  = None
+                hf_legend   = f"HF   {MouseECG.HF[0]}–{MouseECG.HF[1]} Hz  (respiratory)"
+
             # Mouse-specific band definitions (Thireau 2008)
             bands = [
                 (MouseECG.VLF[0], MouseECG.VLF[1], "VLF",
                  f"VLF  {MouseECG.VLF[0]}–{MouseECG.VLF[1]} Hz", BLUE_DARK),
                 (MouseECG.LF[0],  MouseECG.LF[1],  "LF",
                  f"LF   {MouseECG.LF[0]}–{MouseECG.LF[1]} Hz  (baroreflex)", PURPLE),
-                (MouseECG.HF[0],  MouseECG.HF[1],  "HF",
-                 f"HF   {MouseECG.HF[0]}–{MouseECG.HF[1]} Hz  (respiratory)", "#1B5E20"),
+                (MouseECG.HF[0],  MouseECG.HF[1],  "HF", hf_legend, "#1B5E20"),
             ]
 
             # Compute per-band power for annotation
@@ -1176,13 +1241,19 @@ class PlotController:
                         if 0 < boundary < MouseECG.PSD_XLIM:
                             ax.axvline(boundary, color=color, lw=0.8, ls=":",
                                        alpha=0.6, zorder=1)
+                if hf_peak_hz is not None:
+                    ax.plot(hf_peak_hz, float(psd[hf_mask].max()),
+                            marker="v", ms=7, color="#1B5E20", zorder=5)
                 ax.set_xlabel("Frequency (Hz)")
                 ax.set_ylabel("PSD (ms²/Hz)")
                 ax.set_xlim(0, MouseECG.PSD_XLIM)
                 ax.legend(framealpha=0, loc="upper right", fontsize=9)
+                resp_note = (f"  ·  resp. peak {hf_peak_hz:.2f} Hz ≈ "
+                             f"{hf_peak_hz * 60:.0f} breaths/min"
+                             if hf_peak_hz is not None else "")
                 ax.set_title(
                     f"Power spectral density  (Welch · Δf={df:.3f} Hz · "
-                    f"n={N} pts)",
+                    f"n={N} pts){resp_note}",
                     loc="left",
                 )
 
@@ -1387,290 +1458,6 @@ class PlotController:
                 ax_mse.set_xticks([]); ax_mse.set_yticks([])
 
         self.app._slots["poincare"].update(draw_poincare)
-
-    def plot_intervals_ecg(self, r: dict) -> None:
-        """ECG beat strip annotated with P / Q / R / S / T landmarks.
-
-        Design
-        ------
-        • X-axis is relative time from R peak (ms) — always centred at 0.
-        • 3 beats are selected with the most complete wave annotation.
-        • Plus a 4th "anatomy" reference panel on the right.
-        • R_peak_s is read directly from the DataFrame (no index-mapping guesses).
-        """
-        ivl = r.get("intervals")
-        sig = self.app.signal.filtered
-        fs  = self.app.signal.fs
-
-        slot = self.app._slots.get("intervals_ecg")
-        if slot is None:
-            return
-
-        # Guard: need at least a signal and some delineated beats with R_peak_s
-        has_data = (
-            ivl is not None
-            and not ivl.empty
-            and sig is not None
-            and fs is not None
-            and "R_peak_s" in ivl.columns
-        )
-
-        if not has_data:
-            def draw_hint(fig):
-                ax = fig.add_subplot(111)
-                style_axes(ax)
-                ax.text(0.5, 0.5, "Run Interval Delineation to see annotated beats",
-                        ha="center", va="center", color=PLOT["muted"],
-                        transform=ax.transAxes, fontsize=11)
-                ax.set_axis_off()
-            slot.update(draw_hint)
-            return
-
-        # has_data is True → narrow types for static checkers
-        assert ivl is not None
-        assert sig is not None
-        assert fs is not None
-
-        # ── Select up to 3 beats with the most complete wave annotation ──
-        WAVE_POS_COLS = ["P_peak_s", "Q_peak_s", "S_peak_s", "T_peak_s"]
-        available = [c for c in WAVE_POS_COLS if c in ivl.columns]
-
-        if available:
-            completeness = ivl[available].notna().sum(axis=1)
-            # Sort by completeness desc, then by proximity to median RR
-            med_rr = float(ivl["RR_ms"].median()) if "RR_ms" in ivl.columns else 100.0
-            rr_dist = (ivl["RR_ms"] - med_rr).abs() if "RR_ms" in ivl.columns else pd.Series(0, index=ivl.index)
-            sort_key = -completeness * 10 + rr_dist.fillna(999)
-            best_order = sort_key.argsort()
-            picks = list(best_order[:3])
-        else:
-            # No wave positions at all — just pick 3 beats near median RR
-            picks = list(range(min(3, len(ivl))))
-
-        if not picks:
-            slot.update(lambda fig: None)
-            return
-
-        # ── Beat window: -PRE_MS to +POST_MS relative to R peak ────────
-        PRE_MS  = 65    # ms before R  (covers P onset at ~-55ms)
-        POST_MS = 110   # ms after  R  (covers T offset at ~+90ms in mice)
-
-        row_data = ivl.iloc[picks]
-
-        def draw_ecg_preview(fig):
-            # Capture colors in local scope to ensure availability in draw function
-            purple_col = PURPLE
-            teal_col = TEAL
-            orange_deep_col = ORANGE_DEEP
-            
-            # Colour / marker per wave landmark
-            landmark_style = {
-                "P_peak_s":   dict(color="#1A56DB", marker="^",  ms=8,  mew=1.0, label="P"),
-                "Q_peak_s":   dict(color=purple_col, marker="v",  ms=8,  mew=1.0, label="Q"),
-                "S_peak_s":   dict(color=purple_col, marker="v",  ms=8,  mew=1.0, label="S"),
-                "J_peak_s":   dict(color=teal_col, marker="^",  ms=7,  mew=1.0, label="J"),
-                "T_peak_s":   dict(color="#D84315", marker="^",  ms=8,  mew=1.0, label="T"),
-            }
-
-            # Interval spans: (start_col, end_col, colour, label)
-            # None means use R=0 ms as boundary
-            span_defs = [
-                ("P_peak_s",  "Q_peak_s",  "#1A56DB", "P"),    # P peak → Q
-                ("Q_peak_s",  "S_peak_s",  purple_col, "QRS"),  # QRS complex
-                (None,        "T_peak_s",  orange_deep_col, "QT"),   # R → T peak
-            ]
-            # 3 beat columns + 1 anatomy column
-            n_beats = len(picks)
-            from matplotlib.gridspec import GridSpec
-            ratios = [1] * n_beats + [0.55]
-            # This figure now arrives from CanvasSlot with constrained_layout
-            # active, which would recompute/override the explicit margins
-            # below -- opt this one figure out so they stay pixel-identical.
-            try:
-                fig.set_layout_engine(None)
-            except Exception as exc:
-                log.debug("draw_ecg_preview: set_layout_engine(None) failed: %s", exc)
-            gs = GridSpec(1, n_beats + 1, figure=fig,
-                          width_ratios=ratios,
-                          left=0.06, right=0.98, top=0.88, bottom=0.12,
-                          wspace=0.30)
-            axes = [fig.add_subplot(gs[0, i]) for i in range(n_beats + 1)]
-
-            for ax_idx, (_, row) in enumerate(row_data.iterrows()):
-                ax = axes[ax_idx]
-                r_t = float(row.get("R_peak_s", float("nan")))
-                if not np.isfinite(r_t):
-                    ax.set_axis_off()
-                    continue
-
-                r_samp = int(round(r_t * fs))
-                s0 = max(0, int((r_t - PRE_MS / 1000) * fs))
-                s1 = min(len(sig), int((r_t + POST_MS / 1000) * fs))
-                if s1 - s0 < 4:
-                    ax.set_axis_off()
-                    continue
-
-                # Relative time axis (ms, 0 = R peak)
-                t_rel = (np.arange(s0, s1) - r_samp) / fs * 1000
-
-                style_axes(ax)
-                ax.plot(t_rel, sig[s0:s1], color=PLOT["signal"], lw=1.3, zorder=3)
-                ax.axvline(0, color=PLOT["rpeak_ok"], lw=1.0, ls="--", alpha=0.6)
-
-                # R peak marker
-                r_samp_clipped = min(max(r_samp, s0), s1 - 1)
-                ax.plot(0, sig[r_samp_clipped],
-                        marker="o", color=PLOT["rpeak_ok"], ms=8, zorder=7)
-
-                # ── Wave landmark markers ────────────────────────────────
-                for col, style in landmark_style.items():
-                    if col not in row.index:
-                        continue
-                    wt_s = float(row[col]) if pd.notna(row[col]) else float("nan")
-                    if not np.isfinite(wt_s):
-                        continue
-                    wt_rel = (wt_s - r_t) * 1000       # ms relative to R
-                    if not (t_rel[0] - 1 <= wt_rel <= t_rel[-1] + 1):
-                        continue
-                    wt_smp = int(round(wt_s * fs))
-                    wt_smp = min(max(wt_smp, s0), s1 - 1)
-                    w_amp  = sig[wt_smp]
-                    ax.plot(wt_rel, w_amp,
-                            linestyle="none", color=style["color"],
-                            marker=style["marker"], ms=style["ms"],
-                            mew=style["mew"], zorder=6)
-                    # Wave letter label close to the marker
-                    va = "bottom" if style["marker"] == "^" else "top"
-                    offset = 0.04 * (ax.get_ylim()[1] - ax.get_ylim()[0])
-                    y_lbl  = w_amp + offset if va == "bottom" else w_amp - offset
-                    letter = str(style["label"]).split("\n")[0]   # 'P', 'Q', 'S', 'T'
-                    ax.text(wt_rel, y_lbl, letter,
-                            ha="center", va=va, fontsize=8,
-                            color=style["color"], fontweight="bold", zorder=8)
-
-                # ── Interval spans (drawn in axes-fraction y to avoid ylim issues) ─
-                ylo, yhi = ax.get_ylim()
-                yspan    = yhi - ylo if yhi != ylo else 1.0
-
-                def _span(c0, c1, fc, lab):
-                    # x0 / x1 in relative ms
-                    try:
-                        x0 = (float(row[c0]) - r_t) * 1000 if (c0 and c0 in row.index and pd.notna(row[c0])) else 0.0
-                        x1 = (float(row[c1]) - r_t) * 1000 if (c1 and c1 in row.index and pd.notna(row[c1])) else 0.0
-                    except Exception as e:
-                        log.warning("Interval float conversion failed at beat row: %s", e)
-                        return
-                    if not (np.isfinite(x0) and np.isfinite(x1)):
-                        return
-                    # For PR span: goes P_peak → R (x1=0)
-                    # For QT span: goes R (x0=0) → T_peak
-                    x_lo, x_hi = min(x0, x1), max(x0, x1)
-                    if x_hi - x_lo < 0.5:   # skip degenerate spans
-                        return
-                    ax.axvspan(x_lo, x_hi, ymin=0, ymax=1,
-                               color=fc, alpha=0.10, zorder=1)
-                    ax.text((x_lo + x_hi) / 2, yhi - 0.04 * yspan,
-                            lab, ha="center", va="top", fontsize=8,
-                            color=fc, fontweight="bold", zorder=9,
-                            bbox=dict(fc="white", ec="none", alpha=0.7, pad=1))
-
-                # PR interval: P_peak → R (0)
-                if "P_peak_s" in row.index and pd.notna(row["P_peak_s"]):
-                    _span("P_peak_s", None, "#1B5E20", "PR")
-                # QRS: Q → S
-                if "Q_peak_s" in row.index and "S_peak_s" in row.index:
-                    _span("Q_peak_s", "S_peak_s", purple_col, "QRS")
-                # QT: R (0) → T peak
-                if "T_peak_s" in row.index and pd.notna(row.get("T_peak_s", float("nan"))):
-                    _span(None, "T_peak_s", orange_deep_col, "QT")
-
-                # ── Title: measured interval values ──────────────────────
-                parts = []
-                for col_name, label in [("PR_ms","PR"), ("QRS_ms","QRS"),
-                                         ("QT_ms","QT"), ("RR_ms","RR")]:
-                    v = row.get(col_name, float("nan"))
-                    if pd.notna(v) and np.isfinite(float(v)):
-                        parts.append(f"{label} {float(v):.0f}")
-                ax.set_title("  ".join(parts) + " ms" if parts else "Pas d'intervalle",
-                             fontsize=8, color=PLOT["text"])
-                ax.set_xlabel("ms / R", fontsize=7)
-                ax.set_xlim(-PRE_MS, POST_MS)
-                # Auto-scale y to signal content (not matplotlib default)
-                seg_vis = sig[s0:s1]
-                if len(seg_vis) > 0:
-                    sv_lo = float(np.percentile(seg_vis, 2))
-                    sv_hi = float(np.percentile(seg_vis, 98))
-                    sv_pad = max((sv_hi - sv_lo) * 0.25, 0.05)
-                    ax.set_ylim(sv_lo - sv_pad, sv_hi + sv_pad)
-                if ax_idx == 0:
-                    ax.set_ylabel("Amplitude", fontsize=7)
-
-            # ── Anatomy reference panel ──────────────────────────────────
-            ax_ref = axes[-1]
-            ax_ref.set_facecolor(PLOT["axes"])
-            ax_ref.set_xlim(0, 10)
-            ax_ref.set_ylim(0, 10)
-            ax_ref.set_axis_off()
-            ax_ref.set_title("Mouse ECG\ncomplex", fontsize=9,
-                             color=PLOT["text"], fontweight="bold")
-
-            # Draw a schematic mouse ECG with J wave (early repolarisation hump)
-            ecg_x = [0,  1.0, 1.5, 2.0,        # isoelectric
-                     2.5, 2.8,                   # P wave
-                     3.1, 3.4,                   # back to iso
-                     3.7, 3.9,  4.0, 4.2, 4.4,  # Q / R / S
-                     4.6, 4.9,                   # J hump (early repol.)
-                     5.3, 5.8, 6.5, 7.0, 7.8, 8.2, 9.5, 10.0]  # T, return
-            ecg_y = [5,  5.0, 5.2, 5.0,
-                     5.5, 5.8,
-                     5.5, 5.0,
-                     4.7, 2.0, 9.0, 2.5, 4.7,   # Q-dip, R-peak, S-dip
-                     5.1, 5.4,                   # J hump
-                     5.1, 5.0, 5.7, 6.1, 5.7, 5.1, 5.0, 5.0]   # T wave
-
-            ax_ref.plot(ecg_x, ecg_y, color=PLOT["signal"], lw=2.0, zorder=3)
-
-            # Landmark annotations
-            annotations = [
-                (2.8, 6.1, "P",   "#1A56DB",  8),   # P peak
-                (4.0, 9.2, "R",   "#1B5E20",  9),   # R peak
-                (3.9, 1.6, "Q",   purple_col,  8),   # Q dip
-                (4.4, 4.2, "S",   purple_col,  8),   # S dip
-                (4.9, 5.7, "J",   teal_col,  8),   # J hump (new)
-                (6.5, 6.4, "T",   "#D84315",  8),   # T peak
-            ]
-            for (x, y, lbl, col, fs_) in annotations:
-                ax_ref.text(x, y, lbl, ha="center", va="center",
-                            fontsize=fs_, color=col, fontweight="bold", zorder=6)
-
-            # Bracket spans for PR / QRS / QT
-            def _bracket(x0, x1, y, label, col):
-                ax_ref.annotate("", xy=(x1, y), xytext=(x0, y),
-                                arrowprops=dict(arrowstyle="<->", color=col, lw=1.2))
-                ax_ref.text((x0 + x1) / 2, y - 0.5, label,
-                            ha="center", va="top", fontsize=7,
-                            color=col, fontweight="bold")
-
-            _bracket(2.0, 4.0, 1.2, "PR",  "#1B5E20")
-            _bracket(3.7, 4.4, 0.0, "QRS", purple_col)
-            _bracket(4.0, 7.0, 2.1, "QT",  orange_deep_col)
-
-            # Reference values text
-            ref_lines = [
-                ("PR",  "30–55 ms",  "#1B5E20"),
-                ("QRS", " 8–25 ms",  purple_col),
-                ("J",   "15–25 ms",  teal_col),
-                ("QT",  "30–90 ms",  "#D84315"),
-            ]
-            for i, (lbl, val, col) in enumerate(ref_lines):
-                ax_ref.text(0.1, 9.6 - i * 1.1, f"{lbl:4s} {val}",
-                            ha="left", va="top", fontsize=7.5,
-                            color=col, fontfamily="monospace")
-
-            fig.suptitle("ECG beat annotation preview  —  best delineated beats",
-                         fontsize=9, color=PLOT["muted"])
-
-        slot.update(draw_ecg_preview)
 
     def plot_intervals(self, r: dict) -> None:
         """Violin + box plot for PR / QRS / QT / QTc intervals."""
@@ -2264,7 +2051,7 @@ class PlotController:
         result_slots = (
             "rr", "rr_hist",
             "poincare", "psd", "radar",
-            "intervals", "intervals_ecg",
+            "intervals",
             "beat", "beat_dist",
             "epochs", "rolling_hrv",
             "arr_detail",

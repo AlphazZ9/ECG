@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import customtkinter as ctk  # type: ignore[import-untyped]
@@ -103,7 +104,7 @@ from ecg.ui.dialogs import (
     AnnotationManagerDialog, PacingPeriodManagerDialog,
 )
 from ecg.ui.wave_editor import WaveTemplateMiniEditor
-from ecg.ui.sidebar import CollapsibleSection, IntervalVerifierPanel
+from ecg.ui.sidebar import CollapsibleSection
 
 log = logging.getLogger("ecg")
 
@@ -232,8 +233,6 @@ class ECGApp(ctk.CTk):
         self.btn_run_nonlin:    "Optional[ctk.CTkButton]"  = None
         self.btn_run_ivl:       "Optional[ctk.CTkButton]"  = None
         self.btn_run_arrhythmia:"Optional[ctk.CTkButton]"  = None
-        self.frm_ivl_nav:       "Optional[tk.Frame]"       = None
-        self._ivl_verifier:     "Optional[IntervalVerifierPanel]" = None
         self.lbl_freq_status:   "Optional[ctk.CTkLabel]"   = None
         self.lbl_nonlin_status: "Optional[ctk.CTkLabel]"   = None
         self.lbl_ivl_status:    "Optional[ctk.CTkLabel]"   = None
@@ -277,6 +276,8 @@ class ECGApp(ctk.CTk):
         # Sidebar / detection tab widgets (forward-declared)
         self.lbl_npeaks:           "Optional[ctk.CTkLabel]"              = None
         self.btn_review_art:       "Optional[ctk.CTkButton]"             = None
+        self.btn_check_agreement: "Optional[ctk.CTkButton]"              = None
+        self.lbl_agreement_status:"Optional[ctk.CTkLabel]"               = None
         self.lbl_file:             "Optional[ctk.CTkLabel]"              = None
         self.lbl_context_subtitle: "Optional[ctk.CTkLabel]"              = None
         self.lbl_arrhythmia_status:"Optional[ctk.CTkLabel]"              = None
@@ -1633,16 +1634,24 @@ class ECGApp(ctk.CTk):
         file_chip = self._toolbar_chip(row)
         file_chip.pack(side="left", padx=(0, SPACE_M))
 
+        # Open is a one-time setup step, not part of the Detect/Analyze
+        # pipeline -- styled neutral (matching Theme/panel-toggle) rather
+        # than a third saturated-blue button competing with Detect Peaks
+        # for attention.
         ctk.CTkButton(
-            file_chip, text="Open", width=84, height=34,
-            fg_color=BLUE, hover_color=BLUE_HOVER, text_color="white",
-            font=FONT_BTN_PRIMARY, corner_radius=8,
+            file_chip, text="📂  Open", width=90, height=34,
+            fg_color=BORDER, hover_color=BORDER2, text_color=TEXT,
+            font=FONT_BTN_SEC, corner_radius=8,
             command=self._open_file,
         ).pack(side="left", padx=(SPACE_S, SPACE_XS))
 
+        # Starts visibly disabled (muted, matching Undo/Redo's idle look)
+        # rather than a full-saturation green that reads as clickable
+        # before any session exists to save -- _set_save_session_enabled()
+        # restores the green "ready" look the moment it actually is.
         self.btn_save_session = ctk.CTkButton(
             file_chip, text="💾  Save", command=self._save_session,
-            fg_color=GREEN, hover_color=GREEN_DARK, text_color="white",
+            fg_color=BORDER, hover_color=BORDER, text_color=MUTED,
             font=FONT_CARD_TITLE, height=34, corner_radius=8,
             state="disabled")
         self.btn_save_session.pack(side="left", padx=(0, SPACE_S))
@@ -1682,6 +1691,13 @@ class ECGApp(ctk.CTk):
             fg_color=BORDER, hover_color=BORDER2, text_color=MUTED,
             corner_radius=8, state="disabled", command=self._redo_edit)
         self.btn_toolbar_redo.pack(side="left", padx=(0, SPACE_S))
+
+        # Thin vertical rule -- the button chips end here and the rest of
+        # the bar is mostly empty space at idle (no file loaded yet), so a
+        # visible seam anchors "controls" vs. "status" instead of the
+        # identity label appearing to float in a blank stretch.
+        ctk.CTkFrame(row, width=1, fg_color=BORDER).pack(
+            side="left", fill="y", pady=SPACE_S, padx=(0, SPACE_M))
 
         # ── Identity: project name + file name ────────────────────────────
         left = ctk.CTkFrame(row, fg_color="transparent")
@@ -1735,6 +1751,26 @@ class ECGApp(ctk.CTk):
         )
         self.btn_toggle_right_panel.pack(side="left")
         self._bind_hover_tip(self.btn_toggle_right_panel, "Hide/show the right panel")
+
+    def _set_save_session_enabled(self, enabled: bool) -> None:
+        """Enable/disable Save and swap its look to match.
+
+        btn_save_session is built with an explicit muted fg_color rather
+        than relying on CTkButton's default disabled treatment (which
+        only dims the text, not the background) -- without this, the
+        button reads as a clickable, fully-saturated green even while
+        genuinely disabled. Called instead of a bare
+        `.configure(state=...)` at every site that flips this button's
+        availability.
+        """
+        if enabled:
+            self.btn_save_session.configure(
+                state="normal", fg_color=GREEN, hover_color=GREEN_DARK,
+                text_color="white")
+        else:
+            self.btn_save_session.configure(
+                state="disabled", fg_color=BORDER, hover_color=BORDER,
+                text_color=MUTED)
 
     # ─── Right accordion panel ───────────────────────────────────
 
@@ -1903,6 +1939,23 @@ class ECGApp(ctk.CTk):
         # "Savitzky-Golay options" header on first launch even though Method
         # defaults to "SG + Derivative (10 kHz)".
         self._on_det_method_change(self.cb_det_method.get())
+
+        # ── Cross-method agreement ───────────────────────────
+        ctk.CTkFrame(f, height=1, fg_color=BORDER).pack(
+            fill="x", padx=SPACE_M, pady=(SPACE_S, SPACE_XS))
+        self.btn_check_agreement = ctk.CTkButton(
+            f, text="🔍  Check Agreement",
+            command=self._check_method_agreement,
+            fg_color=TEAL, hover_color=TEAL_DARK, text_color="white",
+            font=FONT_BTN_SEC, height=28, corner_radius=8, state="disabled")
+        self.btn_check_agreement.pack(**fpx, fill="x", pady=(0, SPACE_XS))
+        self._bind_hover_tip(
+            self.btn_check_agreement,
+            "Cross-check accepted beats against other detection methods")
+        self.lbl_agreement_status = ctk.CTkLabel(
+            f, text="  Not run yet", font=FONT_KPI_LABEL, text_color=LIGHT,
+            anchor="w", wraplength=230, justify="left")
+        self.lbl_agreement_status.pack(**fpx, fill="x", pady=(0, SPACE_S))
 
     def _build_artifacts_section(self, parent) -> None:
         """ARTIFACTS accordion section (left sidebar), relocated verbatim
@@ -3022,34 +3075,11 @@ class ECGApp(ctk.CTk):
         self.sw_permissive = self._switch(bar, "Permissive bounds", dict(padx=0))
         self.sw_permissive.pack(side="right", padx=(0, SPACE_L))
 
-        # ── Interval verifier nav bar (populated by _launch_interval_verifier) ──
-        self.frm_ivl_nav = tk.Frame(t, bg=PANEL, bd=0, highlightthickness=0)
-        self.frm_ivl_nav.pack(side="top", fill="x")
-
-        # ── Body: violin plots (left) + annotated beat strip (right) ─────────
+        # ── Body: PR/QRS/QT/QTc distribution violin plots, full width ────────
         body = tk.Frame(t, bg=BG, bd=0, highlightthickness=0)
         body.pack(side="top", fill="both", expand=True, padx=SPACE_S, pady=(0, SPACE_S))
 
-        # Use a PanedWindow for resizable split
-        paned = tk.PanedWindow(body, orient=tk.HORIZONTAL,
-                               bg=BORDER, sashwidth=4, sashrelief="flat",
-                               handlesize=0)
-        paned.pack(fill="both", expand=True)
-
-        left_inner = tk.Frame(paned, bg=PANEL, bd=0, highlightthickness=0)
-        right_inner = tk.Frame(paned, bg=PANEL, bd=0, highlightthickness=0)
-        paned.add(left_inner, minsize=180, stretch="always")
-        paned.add(right_inner, minsize=300, stretch="always")
-        # Set initial split after widget is mapped
-        def _set_sash(event=None):
-            try:
-                paned.sash_place(0, max(200, paned.winfo_width() // 3), 0)
-            except Exception:
-                pass
-        paned.bind("<Map>", _set_sash)
-
-        self._slots["intervals"] = CanvasSlot(left_inner, 6, 6, toolbar=False)
-        self._slots["intervals_ecg"] = CanvasSlot(right_inner, 11, 6, toolbar=False)
+        self._slots["intervals"] = CanvasSlot(body, 14, 6, toolbar=False)
 
 
     def _build_tab_beat_template(self) -> None:
@@ -3396,6 +3426,23 @@ class ECGApp(ctk.CTk):
         name = self.ent_project_name.get().strip()  # type: ignore[union-attr]
         self.lbl_topbar_project.configure(text=name if name else "—")  # type: ignore[union-attr]
 
+    def _update_topbar_filename(self) -> None:
+        """Mirror the currently-loaded file's name into the top bar.
+
+        lbl_topbar_file was previously write-once at construction time
+        ("No file loaded") with nothing ever updating it afterward -- it
+        stayed stuck on that placeholder for the rest of the app's life,
+        even with a file loaded and fully analysed. Called wherever
+        self.signal.filepath changes (file load) and from
+        _restore_ui_state() so it survives a theme toggle's rebuild, same
+        as _on_project_name_change().
+        """
+        if self.lbl_topbar_file is None:
+            return
+        fp = self.signal.filepath
+        text = Path(fp).name if fp else "No file loaded"
+        self.lbl_topbar_file.configure(text=text)  # type: ignore[union-attr]
+
     def _on_det_method_change(self, choice: str) -> None:
         """Show/hide SG options frame based on selected detection method."""
         self.detection_ctrl.on_det_method_change(choice)
@@ -3739,6 +3786,10 @@ class ECGApp(ctk.CTk):
 
     # ── Per-module on-demand analysis ────────────────────────
 
+    def _check_method_agreement(self) -> None:
+        """Cross-check accepted beats against other detection methods."""
+        self.detection_ctrl.check_method_agreement()
+
     def _open_artifact_review(self) -> None:
         """Detect artifact candidates and open the interactive review dialog."""
         if self._signal_flt is None or self._rpeaks_ok is None or len(self._rpeaks_ok) < 4:
@@ -3929,22 +3980,8 @@ class ECGApp(ctk.CTk):
             self.btn_toggle_right_panel.configure(text="⟩")
 
     def _run_intervals(self) -> None:
-        """Compute interval delineation in background, then launch verifier."""
+        """Compute interval delineation (PR/QRS/QT/QTc) for every beat."""
         self.analysis_ctrl.run_intervals()
-
-    def _launch_interval_verifier(
-        self,
-        df:       "pd.DataFrame",
-        beat_mat: "np.ndarray",
-        beat_time:"np.ndarray",
-    ) -> None:
-        """Instantiate IntervalVerifierPanel in the intervals tab.
-
-        Called from _run_intervals _done callback (main thread only).
-        The verifier renders into the intervals_ecg CanvasSlot and places
-        its navigation bar into frm_ivl_nav.
-        """
-        self.analysis_ctrl.launch_interval_verifier(df, beat_mat, beat_time)
 
     def _start_async_result(
         self,
@@ -4247,19 +4284,6 @@ class ECGApp(ctk.CTk):
     def _plot_nonlinear(self, r: dict) -> None:
         """Poincaré plot and non-linear HRV metric table."""
         self.plot_ctrl.plot_nonlinear(r)
-
-
-    def _plot_intervals_ecg(self, r: dict) -> None:
-        """ECG beat strip annotated with P / Q / R / S / T landmarks.
-
-        Design
-        ------
-        • X-axis is relative time from R peak (ms) — always centred at 0.
-        • 3 beats are selected with the most complete wave annotation.
-        • Plus a 4th "anatomy" reference panel on the right.
-        • R_peak_s is read directly from the DataFrame (no index-mapping guesses).
-        """
-        self.plot_ctrl.plot_intervals_ecg(r)
 
     def _plot_intervals(self, r: dict) -> None:
         """Violin + box plot for PR / QRS / QT / QTc intervals."""
@@ -4889,15 +4913,15 @@ class ECGApp(ctk.CTk):
         self._update_session_ui(has_session=has_session)
 
         # Enable action buttons if data is ready
-        if self._signal_flt is not None:
-            if self.btn_save_session is not None:
-                self.btn_save_session.configure(state="normal")  # type: ignore[union-attr]
+        if self._signal_flt is not None and self.btn_save_session is not None:
+            self._set_save_session_enabled(True)
         if self._results is not None:
-            for btn_attr in ("btn_run_freq", "btn_run_nonlin", "btn_run_ivl",
-                              "btn_save_session"):
+            for btn_attr in ("btn_run_freq", "btn_run_nonlin", "btn_run_ivl"):
                 btn = getattr(self, btn_attr, None)
                 if btn is not None:
                     btn.configure(state="normal")
+            if self.btn_save_session is not None:
+                self._set_save_session_enabled(True)
 
         # Repaint signal and results
         apply_theme_config(THEME)
