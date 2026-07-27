@@ -286,12 +286,22 @@ def detect_peaks_ml(
 
     _prog(80, f"Classifying {len(candidates):,} candidates…")
     proba = model.estimator.predict_proba(feats)[:, 1]
-    peaks = np.sort(candidates[proba >= 0.5])
+    mask  = proba >= 0.5
+    order = np.argsort(candidates[mask])
+    peaks = candidates[mask][order]
+    # Real classifier confidence for each accepted peak, reordered to match
+    # `peaks` -- returned in the "prominences" slot (same convention as the
+    # other 4 detectors) rather than a recomputed topographic prominence.
+    # apply_threshold()'s thresholding is scale-invariant (median-relative),
+    # so a 0-1 confidence works exactly like an amplitude-scale prominence
+    # there; the difference is this one is an actual per-beat "how sure is
+    # the model" signal instead of a generic morphology proxy, which is what
+    # the UI needs to let a user find "beats worth double-checking".
+    confidence = proba[mask][order]
 
     _prog(95, "Finalising…")
-    prominences = _topographic_prominences(signal, peaks, fs) if len(peaks) else np.array([])
-    thresh_amp = float(np.percentile(prominences, 10)) if len(prominences) else 0.0
-    return peaks, prominences, thresh_amp
+    thresh_amp = float(np.percentile(confidence, 10)) if len(confidence) else 0.0
+    return peaks, confidence, thresh_amp
 
 
 # ════════════════════════════════════════════════════════════

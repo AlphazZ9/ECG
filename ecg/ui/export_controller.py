@@ -110,8 +110,7 @@ class ExportController:
             ("beat",          "06_beat_template",    None),
             ("beat_dist",     "07_beat_morphology",  None),
             ("intervals",     "08_intervals",        None),
-            ("intervals_ecg", "09_intervals_ecg",    None),
-            ("rolling_hrv",   "10_rolling_hrv",      None),
+            ("rolling_hrv",   "09_rolling_hrv",      None),
         ]
 
         saved, skipped = 0, 0

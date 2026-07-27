@@ -23,7 +23,7 @@ ecg/
     plots.py         — style_axes, CanvasSlot (matplotlib ↔ Tk bridge)
     dialogs.py       — ThemeDialog, ArtifactReviewDialog, Annotation dialogs
     wave_editor.py   — WaveTemplateMiniEditor
-    sidebar.py       — CollapsibleSection, IntervalVerifierPanel
+    sidebar.py       — CollapsibleSection
     app.py           — ECGApp (main CTk window)
 """
 

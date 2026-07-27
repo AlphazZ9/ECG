@@ -1130,11 +1130,6 @@ class PacingPeriodManagerDialog(ctk.CTkToplevel):
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  IntervalVerifierPanel — interactive beat-by-beat landmark checker
-# ════════════════════════════════════════════════════════════════════════
-
-
-# ════════════════════════════════════════════════════════════════════════
 #  MLTrainingDialog — train/retrain the ML R-peak detector
 # ════════════════════════════════════════════════════════════════════════
 
@@ -1503,4 +1498,159 @@ class CustomContextDialog(ctk.CTkToplevel):
         if self._on_saved is not None:
             self._on_saved()
         self.destroy()
+
+
+class MethodAgreementDialog(ctk.CTkToplevel):
+    """Non-modal report window for a cross-method agreement check.
+
+    DetectionController.check_method_agreement() runs whichever of
+    Wavelet / SG+Derivative / Envelope Max / ML AREN'T the currently
+    active method and counts, per accepted beat, how many of them also
+    found a matching peak. The sidebar status label only has room for a
+    one-line summary; this window shows the full per-method breakdown,
+    the agreement-count distribution, and a jump-to-beat list for every
+    beat none of the other methods confirmed. Left non-modal (no
+    grab_set()) so the user can click "View" on several beats in a row
+    without the dialog blocking the main plot each time.
+    """
+
+    MAX_ROWS = 300
+
+    def __init__(self, parent: "ECGApp", result: dict, fs: float) -> None:
+        super().__init__(parent)
+        self._app = parent
+        self._fs = fs
+        self.title("Cross-Method Agreement")
+        self.geometry("520x700")
+        self.minsize(440, 460)
+        self.resizable(True, True)
+        self.configure(fg_color=BG)
+        self.lift()
+        self.focus_force()
+
+        n_methods  = result["n_methods"]
+        n_beats    = result["n_beats"]
+        n_disagree = result["n_disagree"]
+        pct_confirmed = 100.0 * (n_beats - n_disagree) / max(n_beats, 1)
+        color = (GREEN if n_disagree == 0
+                 else ORANGE if pct_confirmed >= 90 else RED)
+
+        # ── Header ───────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0)
+        hdr.pack(fill="x", side="top")
+        ctk.CTkLabel(hdr, text="🔍  Cross-Method Agreement", font=FONT_BTN_PRIMARY,
+                     text_color=TEXT, anchor="w").pack(fill="x", padx=16, pady=(12, 2))
+        ctk.CTkLabel(
+            hdr, text=f"{pct_confirmed:.0f}% of {n_beats} beats confirmed by "
+                      f"≥ 1 other method  ·  {n_disagree} unconfirmed",
+            font=FONT_SMALL, text_color=color, anchor="w"
+        ).pack(fill="x", padx=16, pady=(0, 12))
+
+        # ── Close ────────────────────────────────────────────────────
+        # Packed with side="bottom" *before* the flexible middle content
+        # below so it always reserves its slice of the cavity -- packing
+        # it last (side="top", default) let a tall methods/breakdown/list
+        # stack squeeze it down past the window's bottom edge.
+        ctk.CTkButton(self, text="Close", command=self.destroy,
+                     fg_color=BORDER, hover_color=BORDER2, text_color=TEXT,
+                     font=FONT_BTN_SEC, height=32, corner_radius=8
+                     ).pack(side="bottom", fill="x", padx=16, pady=16)
+
+        # ── Methods compared ─────────────────────────────────────────
+        methods_card = ctk.CTkFrame(self, fg_color=CARD, corner_radius=8)
+        methods_card.pack(fill="x", padx=16, pady=(12, 8))
+        ctk.CTkLabel(methods_card, text="METHODS COMPARED", font=FONT_SUBSECTION,
+                     text_color=MUTED, anchor="w").pack(fill="x", padx=12, pady=(10, 4))
+        rows = ([(f"✔  {m}", TEXT) for m in result.get("methods_run", [])]
+                + [(f"—  {m}", MUTED) for m in result.get("methods_skipped", [])])
+        for i, (txt, col) in enumerate(rows):
+            ctk.CTkLabel(methods_card, text=txt, font=FONT_SMALL, text_color=col,
+                         anchor="w", wraplength=460, justify="left"
+                         ).pack(fill="x", padx=12, pady=(1, 10 if i == len(rows) - 1 else 1))
+
+        # ── Agreement breakdown ──────────────────────────────────────
+        hist_card = ctk.CTkFrame(self, fg_color=CARD, corner_radius=8)
+        hist_card.pack(fill="x", padx=16, pady=(0, 8))
+        ctk.CTkLabel(hist_card, text="AGREEMENT BREAKDOWN", font=FONT_SUBSECTION,
+                     text_color=MUTED, anchor="w").pack(fill="x", padx=12, pady=(10, 6))
+        histogram = result.get("histogram") or []
+        max_count = max(histogram) if histogram else 1
+        for k in range(len(histogram) - 1, -1, -1):
+            beats_k = histogram[k]
+            label = ("All %d agree" % n_methods) if k == n_methods else \
+                    ("None agree" if k == 0 else f"{k} of {n_methods} agree")
+            row = ctk.CTkFrame(hist_card, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=2)
+            ctk.CTkLabel(row, text=label, font=FONT_SMALL, text_color=TEXT,
+                         width=110, anchor="w").pack(side="left")
+            bar = ctk.CTkProgressBar(
+                row, height=10, corner_radius=4, fg_color=BORDER,
+                progress_color=(GREEN if k == n_methods else
+                                RED if k == 0 else ORANGE))
+            bar.set((beats_k / max_count) if max_count else 0)
+            bar.pack(side="left", fill="x", expand=True, padx=8)
+            ctk.CTkLabel(row, text=str(beats_k), font=FONT_SMALL, text_color=MUTED,
+                         width=36, anchor="e").pack(side="left")
+        ctk.CTkFrame(hist_card, fg_color="transparent", height=8).pack()
+
+        # ── Unconfirmed-beat list ────────────────────────────────────
+        list_wrap = ctk.CTkFrame(self, fg_color="transparent")
+        list_wrap.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        ctk.CTkLabel(list_wrap, text=f"UNCONFIRMED BEATS ({n_disagree})",
+                     font=FONT_SUBSECTION, text_color=MUTED, anchor="w"
+                     ).pack(fill="x", pady=(0, 4))
+
+        disagree_samples = result.get("disagree_samples")
+        if disagree_samples is None or len(disagree_samples) == 0:
+            empty = ctk.CTkFrame(list_wrap, fg_color=CARD, corner_radius=8)
+            empty.pack(fill="both", expand=True)
+            ctk.CTkLabel(empty, text="✔  Every accepted beat was confirmed by "
+                                     "at least one other method.",
+                         font=FONT_SMALL, text_color=GREEN, wraplength=440,
+                         justify="left").pack(padx=16, pady=14)
+        else:
+            scroll = ctk.CTkScrollableFrame(
+                list_wrap, fg_color=CARD, corner_radius=8,
+                scrollbar_button_color=BORDER,
+                scrollbar_button_hover_color=BORDER2)
+            scroll.pack(fill="both", expand=True)
+            times = sorted(float(s) / fs for s in disagree_samples)
+            for i, t in enumerate(times[:self.MAX_ROWS]):
+                row = ctk.CTkFrame(scroll, fg_color=CARD if i % 2 == 0 else BG,
+                                   corner_radius=0)
+                row.pack(fill="x", pady=1)
+                ctk.CTkLabel(row, text=f"t = {t:.3f} s", font=FONT_SMALL,
+                             text_color=TEXT, anchor="w").pack(
+                                 side="left", padx=(10, 4), pady=6)
+                ctk.CTkButton(row, text="→ View", width=70, height=24,
+                             font=FONT_SMALL, fg_color=BORDER, hover_color=BORDER2,
+                             text_color=TEXT, command=lambda t=t: self._jump_to(t)
+                             ).pack(side="right", padx=(4, 10), pady=4)
+            if len(times) > self.MAX_ROWS:
+                ctk.CTkLabel(
+                    scroll, text=f"… {len(times) - self.MAX_ROWS} more not shown "
+                                 f"(showing the first {self.MAX_ROWS} by time)",
+                    font=FONT_SMALL, text_color=MUTED
+                ).pack(fill="x", pady=6)
+
+    def _jump_to(self, t: float) -> None:
+        """Center the Detection tab's view on beat time *t* (seconds)."""
+        app = self._app
+        try:
+            sig_dur = float(app.signal.time[-1]) if app.signal.time is not None else t
+            try:
+                win = float(app.ent_window.get())  # type: ignore[union-attr]
+            except Exception:
+                win = 2.0
+            app.ui.nav_pos = max(0.0, min(t - win / 2, max(0.0, sig_dur - win)))
+            app._sync_nav_pos_entry()
+            try:
+                app.tabs.set("📈 Detection")
+            except Exception as e:
+                log.debug("tabs.set Detection failed: %s", e)
+            app._draw_detail()
+            self.lift()
+            self.focus_force()
+        except Exception:
+            log.exception("MethodAgreementDialog: jump-to-beat failed")
 

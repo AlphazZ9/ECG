@@ -9,6 +9,7 @@ signal-quality scoring.
 from __future__ import annotations
 
 import logging
+from tkinter import messagebox
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -16,11 +17,16 @@ import numpy as np
 import customtkinter as ctk  # type: ignore[import-untyped]
 
 from ecg.core.models import MouseECG
-from ecg.core.detection import apply_threshold
+from ecg.core.detection import (
+    apply_threshold, peak_agreement_counts,
+    detect_peaks_wavelet, detect_peaks_sg_derivative, detect_peaks_envelope_max,
+)
+from ecg.core.ml_detector import detect_peaks_ml, MLPeakModel
 from ecg.ui.theme import (
     BLUE, BORDER, BORDER2, GREEN, LIGHT, MUTED, ORANGE, ORANGE_DEEP, RED,
 )
 from ecg.ui.widgets import update_quality_gauge
+from ecg.ui.dialogs import MethodAgreementDialog
 
 if TYPE_CHECKING:
     from ecg.ui.app import ECGApp
@@ -106,6 +112,9 @@ class DetectionController:
         # Enable the artifact review button as soon as peaks are available
         self.app.after(0, lambda: self.app.btn_review_art.configure(  # type: ignore[union-attr]
             state="normal" if n > 4 else "disabled"))
+        if self.app.btn_check_agreement is not None:
+            self.app.after(0, lambda: self.app.btn_check_agreement.configure(  # type: ignore[union-attr]
+                state="normal" if n > 4 else "disabled"))
         self.update_signal_quality(accepted)
         return n
 
@@ -658,3 +667,131 @@ class DetectionController:
             col, label = RED,     f"● Poor  {mean_r:.3f}  ({pct:.0f}% low)"
         self.app._lbl_quality_badge.configure(text=label, fg_color=col,
                                            text_color="white")
+
+    def check_method_agreement(self) -> None:
+        """Cross-check the active detection result against independently
+        implemented detectors run on the same (already filtered) signal.
+
+        A beat several DIFFERENT algorithms all miss is a far stronger
+        "this one is questionable" signal than any single method's own
+        confidence -- this is complementary to that per-peak confidence,
+        not a replacement for it.
+
+        Deliberately excludes "Auto" and whichever method is currently
+        active from the comparison set: re-running the active method
+        against itself would trivially "agree" on every beat, and Auto's
+        candidate generation is entangled with fix_polarity()'s own
+        polarity vote in a way that doesn't cleanly separate into a
+        standalone re-invocation. Wavelet, SG+Derivative, and Envelope Max
+        are independent implementations already; the ML detector joins
+        them when a trained model exists. Any method that's unavailable
+        (no PyWavelets, no trained model, or a genuine failure) is skipped
+        with a reason shown to the user rather than silently dropped.
+        """
+        if self.app.signal.filtered is None or self.app.detection.rpeaks_ok is None \
+                or len(self.app.detection.rpeaks_ok) == 0:
+            messagebox.showwarning("Not ready", "Run Preview Detection first.")
+            return
+
+        # Snapshot on the main thread -- the worker runs in a background
+        # thread and must not touch Tk widgets or shared self.app.* state
+        # that a new file load could reset mid-run.
+        sig       = self.app.signal.filtered
+        fs        = self.app.signal.fs
+        primary   = self.app.detection.rpeaks_ok.copy()
+        min_rr_ms = self.app._safe_float(self.app.ent_minrr, MouseECG.MIN_RR_MS)
+        active    = (self.app.cb_det_method.get()
+                     if self.app.cb_det_method is not None else "").lower()
+        tolerance_samples = max(1, int(round(0.010 * fs)))  # 10 ms snap tolerance
+
+        if self.app.lbl_agreement_status is not None:
+            self.app.lbl_agreement_status.configure(
+                text="  Running other detectors…", text_color=ORANGE)
+
+        def _worker() -> dict:
+            other_peaks: "list[np.ndarray]" = []
+            methods_run: "list[str]" = []
+            methods_skipped: "list[str]" = []
+
+            def _try(name: str, active_key: str, fn) -> None:
+                if active_key in active:
+                    methods_skipped.append(f"{name} (already the active method)")
+                    return
+                try:
+                    peaks, _proms, _t = fn()
+                    other_peaks.append(np.asarray(peaks))
+                    methods_run.append(f"{name} ({len(peaks)} peaks)")
+                except Exception as exc:
+                    methods_skipped.append(f"{name} ({exc})")
+
+            _try("Wavelet", "wavelet",
+                 lambda: detect_peaks_wavelet(sig, fs, min_rr_ms=min_rr_ms))
+            _try("SG+Derivative", "sg",
+                 lambda: detect_peaks_sg_derivative(sig, fs, min_rr_ms=min_rr_ms))
+            _try("Envelope Max", "envelope",
+                 lambda: detect_peaks_envelope_max(sig, fs, min_rr_ms=min_rr_ms))
+            if "ml" in active or "machine" in active:
+                methods_skipped.append("ML Detector (already the active method)")
+            else:
+                try:
+                    model = MLPeakModel.load()
+                    peaks, _proms, _t = detect_peaks_ml(sig, fs, model)
+                    other_peaks.append(np.asarray(peaks))
+                    methods_run.append(f"ML Detector ({len(peaks)} peaks)")
+                except Exception as exc:
+                    methods_skipped.append(f"ML Detector ({exc})")
+
+            if not other_peaks:
+                return {"ok": False, "methods_skipped": methods_skipped}
+
+            counts     = peak_agreement_counts(primary, other_peaks, tolerance_samples)
+            n_methods  = len(other_peaks)
+            n_disagree = int(np.sum(counts == 0))
+            n_full     = int(np.sum(counts == n_methods))
+            histogram  = [int(np.sum(counts == k)) for k in range(n_methods + 1)]
+            return {
+                "ok": True,
+                "methods_run": methods_run,
+                "methods_skipped": methods_skipped,
+                "n_methods": n_methods,
+                "n_beats": len(primary),
+                "n_disagree": n_disagree,
+                "n_full": n_full,
+                "histogram": histogram,
+                "disagree_samples": primary[counts == 0],
+            }
+
+        def _done(result: dict) -> None:
+            if self.app.detection.rpeaks_ok is None:
+                return
+            if not result.get("ok"):
+                reason = "; ".join(result.get("methods_skipped", [])) or "no other methods available"
+                if self.app.lbl_agreement_status is not None:
+                    self.app.lbl_agreement_status.configure(
+                        text=f"  Agreement check: {reason}", text_color=ORANGE)
+                self.app._set_status(f"Cross-method agreement: {reason}", ORANGE)
+                return
+
+            self.app.detection.agreement_disagree_samples = result["disagree_samples"]
+            n_beats     = result["n_beats"]
+            n_disagree  = result["n_disagree"]
+            pct_confirmed = 100.0 * (n_beats - n_disagree) / max(n_beats, 1)
+            summary = (
+                f"{result['n_methods']} other method(s) · "
+                f"{pct_confirmed:.0f}% beats confirmed by ≥1 other · "
+                f"{n_disagree} unconfirmed"
+            )
+            self.app.detection.agreement_summary = summary
+            if self.app.lbl_agreement_status is not None:
+                color = (GREEN if n_disagree == 0
+                         else ORANGE if pct_confirmed >= 90 else RED)
+                self.app.lbl_agreement_status.configure(text=f"  {summary}", text_color=color)
+            skipped = result.get("methods_skipped", [])
+            skipped_note = ("  ·  skipped: " + ", ".join(skipped)) if skipped else ""
+            self.app._set_status(
+                f"Cross-method agreement done — {summary}{skipped_note}", GREEN)
+            self.app._draw_detail()
+            MethodAgreementDialog(self.app, result=result, fs=fs)
+
+        self.app._start_async_result(
+            self.app.btn_check_agreement, "Checking…", _worker, _done)

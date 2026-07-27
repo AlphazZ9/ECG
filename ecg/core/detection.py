@@ -745,6 +745,43 @@ def apply_threshold(
     return accepted, rejected, thresh_amp
 
 
+def peak_agreement_counts(
+    primary: np.ndarray,
+    others: "list[np.ndarray]",
+    tolerance_samples: int,
+) -> np.ndarray:
+    """For each peak in *primary*, count how many arrays in *others* have a
+    peak within *tolerance_samples* of it.
+
+    Pure array-matching helper for cross-method agreement checks -- takes
+    already-computed peak-sample arrays from independent detectors (e.g.
+    Wavelet, SG+Derivative, Envelope Max, ML) and reports, per beat in the
+    currently-active detection result, how many of the *other* methods
+    also found a peak there. A beat with a low count across several
+    independently-implemented detectors is a much stronger "this beat is
+    questionable" signal than any single method's own confidence score.
+
+    Each element of *others* must be sorted ascending (true of every
+    detect_peaks_* function's output). Uses searchsorted for O(n log m)
+    matching per method instead of an O(n*m) all-pairs comparison.
+    """
+    counts = np.zeros(len(primary), dtype=int)
+    if len(primary) == 0:
+        return counts
+    primary = np.asarray(primary)
+    for other in others:
+        other = np.asarray(other)
+        if len(other) == 0:
+            continue
+        idx    = np.searchsorted(other, primary)
+        idx_lo = np.clip(idx - 1, 0, len(other) - 1)
+        idx_hi = np.clip(idx, 0, len(other) - 1)
+        d_lo   = np.abs(primary - other[idx_lo])
+        d_hi   = np.abs(primary - other[idx_hi])
+        counts += (np.minimum(d_lo, d_hi) <= tolerance_samples).astype(int)
+    return counts
+
+
 # ════════════════════════════════════════════════════════════
 #  HELPERS PARTAGÉS — calibration CWT physique, seuillage robuste,
 #  validation morphologique locale (partagée wavelet + SG)

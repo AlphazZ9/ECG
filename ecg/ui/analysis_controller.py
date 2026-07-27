@@ -23,7 +23,6 @@ from ecg.core.detection import classify_arrhythmias, correct_rr_artifacts
 from ecg.core.analysis import analyse_core, analyse_hrv_freq, analyse_hrv_nonlinear, analyse_intervals
 from ecg.core.wave_template import WaveTemplate
 from ecg.io.session import load_session
-from ecg.ui.sidebar import IntervalVerifierPanel
 from ecg.ui.theme import (
     PLOT, RED, RED_MID, RED_LIGHT, AMBER, BLUE, BLUE_DARK, BLUE_MID,
     GREEN, GREEN_DARK, GREEN_MID, ORANGE, ORANGE_DARK, ORANGE_DEEP,
@@ -944,7 +943,7 @@ class AnalysisController:
         # Enable Save Session now that we have results
         self.app._update_quality_badge()
         if self.app.btn_save_session is not None:
-            self.app.btn_save_session.configure(state="normal")  # type: ignore[union-attr]
+            self.app._set_save_session_enabled(True)
         self.app.session.dirty = True
         # Update session/template info labels
         self.app._update_session_ui(
@@ -1059,7 +1058,7 @@ class AnalysisController:
         self.app._start_async_result(self.app.btn_run_nonlin, "Computing…", _worker, _done)  # type: ignore[arg-type]
 
     def run_intervals(self) -> None:
-        """Compute interval delineation in background, then launch verifier."""
+        """Compute interval delineation (PR/QRS/QT/QTc) for every beat."""
         if self.app.analysis.results is None or self.app.signal.filtered is None or self.app.detection.rpeaks_ok is None:
             messagebox.showwarning("Not ready", "Run Core Analysis first.")
             return
@@ -1087,35 +1086,19 @@ class AnalysisController:
         permissive_for_worker = (bool(self.app.sw_permissive.get())  # type: ignore[union-attr]
                                   if self.app.sw_permissive is not None else False)
 
-        def _worker() -> "tuple[pd.DataFrame, np.ndarray, np.ndarray]":
+        def _worker() -> "pd.DataFrame":
             def _prog(p: int, m: str) -> None:
                 self.app.after(0, lambda pp=p, mm=m: self.app._set_progress(pp, mm))
 
-            # Build beat matrix here so it can be passed to the verifier
-            fixed_hw  = int(MouseECG.BEAT_HALF_WIN_S * fs)
-            rr_samp   = np.diff(rp) if len(rp) > 1 else np.array([fixed_hw * 2])
-            rr_min_s  = int(rr_samp.min()) if len(rr_samp) else fixed_hw * 2
-            half_win  = max(20, min(fixed_hw, int(rr_min_s * 0.45)))
-            bt_ms     = np.arange(-half_win, half_win) / fs * 1000
-            mask_v    = (rp - half_win >= 0) & (rp + half_win < len(sig))
-            valid_rp  = rp[mask_v]
-            if len(valid_rp) >= 2:
-                idx_mat  = valid_rp[:, None] + np.arange(-half_win, half_win)
-                beat_mat = sig[idx_mat].astype(float)
-            else:
-                beat_mat = np.zeros((0, half_win * 2))
+            return analyse_intervals(sig, rp, fs, rr,
+                                     progress_cb=_prog,
+                                     wave_template=wt_for_worker,
+                                     permissive_bounds=permissive_for_worker)
 
-            df = analyse_intervals(sig, rp, fs, rr,
-                                   progress_cb=_prog,
-                                   wave_template=wt_for_worker,
-                                   permissive_bounds=permissive_for_worker)
-            return df, beat_mat, bt_ms
-
-        def _done(result: "tuple[pd.DataFrame, np.ndarray, np.ndarray]") -> None:
+        def _done(df: "pd.DataFrame") -> None:
             if self.app.analysis.results is None or getattr(self.app, "_generation", 0) != _gen:
                 log.info("_run_intervals: stale result discarded (file changed)")
                 return
-            df, beat_mat, bt_ms = result
             self.app.analysis.results["intervals"] = df
 
             interval_cols = [c for c in ["PR_ms", "QRS_ms", "QT_ms"] if c in df.columns]
@@ -1124,74 +1107,21 @@ class AnalysisController:
 
             wt        = self.app.analysis.wave_template
             tmpl_note = f"  template:{wt.source}" if wt else ""
-            note      = f"  {n_ok}/{n_total} complete — verify in panel below{tmpl_note}"
+            note      = f"  {n_ok}/{n_total} complete{tmpl_note}"
             note_color = GREEN if n_ok > 0 else ORANGE
             if n_ok == 0 and n_total > 0:
                 note += "  ⚠ check template / filters"
             if self.app.lbl_ivl_status is not None:
                 self.app.lbl_ivl_status.configure(text=note, text_color=note_color)  # type: ignore[union-attr]
 
-            # Launch interactive verifier (replaces static beat strip)
-            self.launch_interval_verifier(df, beat_mat, bt_ms)
-
-            # Plot distributions immediately with all beats
             results: dict = self.app.analysis.results
             self.app._run_plot_chain(
                 [("ECG intervals", lambda: self.app._plot_intervals(results)),
                  ("Summary",       lambda: self.app._plot_summary(results))],
                 on_complete=lambda: self.app._set_status(
-                    f"Interval delineation done — {n_ok}/{n_total} beats  "
-                    "| verify in panel below then click Finalise", note_color))
+                    f"Interval delineation done — {n_ok}/{n_total} beats", note_color))
 
         self.app._start_async_result(self.app.btn_run_ivl, "Delineating…", _worker, _done)  # type: ignore[arg-type]
-
-    def launch_interval_verifier(
-        self,
-        df:       "pd.DataFrame",
-        beat_mat: "np.ndarray",
-        beat_time:"np.ndarray",
-    ) -> None:
-        """Instantiate IntervalVerifierPanel in the intervals tab.
-
-        Called from _run_intervals _done callback (main thread only).
-        The verifier renders into the intervals_ecg CanvasSlot and places
-        its navigation bar into frm_ivl_nav.
-        """
-        slot = self.app._slots.get("intervals_ecg")
-        nav  = self.app.frm_ivl_nav
-        if slot is None or nav is None:
-            return
-
-        def _on_finalise(verified_df: "pd.DataFrame") -> None:
-            """Replace stored intervals with verified subset; re-plot."""
-            if self.app.analysis.results is None:
-                return
-            self.app.analysis.results["intervals"] = verified_df
-            results: dict = self.app.analysis.results
-            n_ok    = int((~verified_df[["PR_ms","QRS_ms","QT_ms"]]
-                           .isna().any(axis=1)).sum()) if all(  # type: ignore[arg-type]
-                               c in verified_df.columns for c in
-                               ["PR_ms","QRS_ms","QT_ms"]) else 0
-            if self.app.lbl_ivl_status is not None:
-                self.app.lbl_ivl_status.configure(  # type: ignore[union-attr]
-                    text=f"  ✓ Finalised — {n_ok}/{len(verified_df)} beats accepted",
-                    text_color=GREEN)
-            self.app._run_plot_chain(
-                [("ECG intervals", lambda: self.app._plot_intervals(results)),
-                 ("Summary",       lambda: self.app._plot_summary(results))],
-                on_complete=lambda: self.app._set_status(
-                    f"Intervals finalised — {n_ok}/{len(verified_df)} beats", GREEN))
-
-        n_verifier = min(len(df), len(beat_mat))
-        self.app._ivl_verifier = IntervalVerifierPanel(
-            df        = df.iloc[:n_verifier],
-            beat_mat  = beat_mat[:n_verifier],
-            beat_time = beat_time,
-            fs        = self.app.signal.fs,
-            slot      = slot,
-            nav_frame = nav,
-            on_finalise = _on_finalise,
-        )
 
     def compute_epochs(self) -> None:
         """Compute epoch-level HRV in a background thread to keep the UI responsive.

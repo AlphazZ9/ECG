@@ -345,7 +345,7 @@ class SessionController:
         self.app._run_detection(thr)
 
         # ── Enable analysis buttons ──────────────────────────────────────
-        self.app.btn_save_session.configure(state="normal")  # type: ignore[union-attr]
+        self.app._set_save_session_enabled(True)
         for btn_attr in ("btn_run_freq", "btn_run_nonlin", "btn_run_ivl"):
             if getattr(self.app, btn_attr, None) is not None:
                 getattr(self.app, btn_attr).configure(state="normal")
@@ -744,6 +744,7 @@ class SessionController:
         # bar mirror label (that label was just rebuilt fresh at "—") --
         # explicitly resync it, same as the file-info/peak-count labels below.
         self.app._on_project_name_change()
+        self.app._update_topbar_filename()
 
         sw_map = {
             "sw_show_raw": "sw_show_raw",
