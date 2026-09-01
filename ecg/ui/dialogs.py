@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import matplotlib
+from datetime import datetime
 from matplotlib.figure import Figure
 from pathlib import Path
 from typing import Any, Callable, Optional, TYPE_CHECKING
@@ -26,7 +27,7 @@ from ecg.ui.theme import (
     THEME, ThemeConfig, apply_theme_config,
     BG, PANEL, CARD, BORDER, BORDER2, TEXT, MUTED, LIGHT, PLOT,
     RED, BLUE, GREEN, GREEN_DARK, ORANGE, PURPLE, PURPLE_DARK,
-    BLUE_HOVER, RED_DARK, ORANGE_DARK, ORANGE_DEEP,
+    BLUE_HOVER, RED_DARK, ORANGE_DARK, ORANGE_DEEP, TEAL, PINK, CYAN, AMBER,
     GRAY, GRAY_LIGHT, ARTIFACT_TYPE_COLOR,
     FONT_TITLE, FONT_SECTION_HDR, FONT_LABEL, FONT_SMALL,
     FONT_BODY, FONT_BTN_PRIMARY, FONT_BTN_SEC, FONT_SIDEBAR_HDR,
@@ -1653,4 +1654,116 @@ class MethodAgreementDialog(ctk.CTkToplevel):
             self.focus_force()
         except Exception:
             log.exception("MethodAgreementDialog: jump-to-beat failed")
+
+
+class CohortTrendsDialog(ctk.CTkToplevel):
+    """Plots HR mean / SDNN / RMSSD across every recording in the SQLite
+    registry, so recordings saved once and never revisited again become
+    comparable across a whole study instead of staying siloed per-file.
+
+    Points are grouped/coloured by "Project name" (the sidebar entry
+    ecg.ui.app._on_project_name_change tracks) since that field is
+    already meant to span many recordings in one working session --
+    recordings with no project name are grouped under "Ungrouped" in a
+    neutral grey rather than claiming a colour from the cycle.
+    """
+
+    _PALETTE = [BLUE, GREEN, ORANGE, PURPLE, TEAL, PINK, CYAN, AMBER, RED]
+
+    def __init__(self, parent, rows: "list[dict]") -> None:
+        super().__init__(parent)
+        self.title("Cohort Trends")
+        self.geometry("820x680")
+        self.minsize(600, 480)
+        self.resizable(True, True)
+        self.configure(fg_color=PANEL)
+        self.lift()
+        self.focus_force()
+
+        ctk.CTkLabel(self, text="📈  Cohort Trends", font=FONT_BTN_PRIMARY,
+                     text_color=TEXT, anchor="w").pack(fill="x", padx=16, pady=(14, 2))
+        ctk.CTkLabel(
+            self, text="Heart rate, SDNN, and RMSSD across every saved "
+                      "recording in the registry, ordered by save time and "
+                      "coloured by Project name.",
+            font=FONT_SMALL, text_color=MUTED, anchor="w"
+        ).pack(fill="x", padx=16, pady=(0, 10))
+
+        usable = [r for r in rows if r.get("saved_at")]
+        if not usable:
+            ctk.CTkLabel(
+                self, text="No cohort data yet — save a session for at "
+                          "least one recording to start building trends.",
+                font=FONT_SMALL, text_color=MUTED, wraplength=600,
+                justify="left").pack(padx=16, pady=40)
+            return
+
+        plot_card = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=6)
+        plot_card.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        fig = Figure(figsize=(7.6, 6.4), dpi=96, facecolor=PLOT["bg"], tight_layout=True)
+        canvas = FigureCanvasTkAgg(fig, master=plot_card)
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
+
+        self._draw(fig, usable)
+        canvas.draw()
+
+    def _draw(self, fig: Figure, rows: "list[dict]") -> None:
+        fig.patch.set_facecolor(PLOT["bg"])
+
+        def _parse(ts: str):
+            try:
+                return datetime.fromisoformat(ts)
+            except Exception:
+                return None
+
+        parsed = [(r, _parse(r.get("saved_at", ""))) for r in rows]
+        parsed = [(r, dt) for r, dt in parsed if dt is not None]
+        parsed.sort(key=lambda item: item[1])
+
+        groups: "dict[str, list[tuple[dict, Any]]]" = {}
+        for r, dt in parsed:
+            key = (r.get("project_name") or "").strip() or "Ungrouped"
+            groups.setdefault(key, []).append((r, dt))
+        names = sorted(k for k in groups if k != "Ungrouped")
+        colors = {name: self._PALETTE[i % len(self._PALETTE)]
+                  for i, name in enumerate(names)}
+        colors["Ungrouped"] = MUTED
+
+        specs = [
+            ("hr_mean", "Heart rate (bpm)"),
+            ("sdnn",    "SDNN (ms)"),
+            ("rmssd",   "RMSSD (ms)"),
+        ]
+        axes = fig.subplots(3, 1, sharex=True)
+        for ax, (key, ylabel) in zip(axes, specs):
+            for name, items in groups.items():
+                pts = [(dt, r[key]) for r, dt in items if r.get(key) is not None]
+                if not pts:
+                    continue
+                xs, ys = zip(*pts)
+                col = colors[name]
+                if len(pts) > 1:
+                    ax.plot(xs, ys, "-", color=col, alpha=0.5, lw=1.2, zorder=2)
+                ax.scatter(xs, ys, color=col, s=28, zorder=3, label=name,
+                          edgecolors=PLOT["bg"], linewidths=0.6)
+            ax.set_facecolor(PLOT["axes"])
+            ax.set_ylabel(ylabel, color=PLOT["muted"], fontsize=9)
+            ax.tick_params(colors=PLOT["muted"], labelsize=8)
+            for sp in ax.spines.values():
+                sp.set_color(PLOT["border"])
+            ax.grid(True, color=PLOT["grid"], lw=0.5, alpha=0.6)
+
+        # One shared legend on the top subplot -- the colour mapping is
+        # identical across all three, repeating it three times would just
+        # be noise.
+        handles, labels = axes[0].get_legend_handles_labels()
+        if handles:
+            by_label = dict(zip(labels, handles))
+            axes[0].legend(by_label.values(), by_label.keys(),
+                          framealpha=0, loc="upper left", fontsize=7,
+                          ncol=min(4, len(by_label)))
+
+        axes[-1].set_xlabel("Saved at", color=PLOT["muted"], fontsize=9)
+        fig.autofmt_xdate(rotation=25)
 

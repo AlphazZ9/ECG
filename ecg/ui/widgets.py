@@ -9,12 +9,14 @@ meant to be imported from more than one call site.
 """
 from __future__ import annotations
 
+import tkinter as tk
 from typing import Optional
 
 import customtkinter as ctk  # type: ignore[import-untyped]
+import numpy as np
 
 from ecg.ui.theme import (
-    CARD, BORDER, TEXT, MUTED, LIGHT,
+    CARD, BORDER, TEXT, MUTED, LIGHT, BLUE,
     GREEN, GREEN_MID, AMBER, RED,
     FONT_KPI_LABEL, FONT_KPI_VALUE, FONT_KPI_HERO, FONT_MICRO, FONT_HINT,
 )
@@ -193,3 +195,40 @@ def update_quality_gauge(gauge: ctk.CTkFrame, score: "Optional[int]") -> None:
     text = "—" if score is None else f"{label}  ·  {score}%"
     gauge.score_label.configure(text=text, text_color=color)  # type: ignore[attr-defined]
     _recolor_quality_zones(gauge, idle=(score is None))
+
+
+def make_sparkline(
+    parent,
+    values: "Optional[np.ndarray]",
+    *,
+    width: int = 90,
+    height: int = 26,
+    color: str = BLUE,
+    bg: "Optional[str]" = None,
+) -> tk.Canvas:
+    """Tiny polyline preview of a short numeric series (e.g. RR_ms per beat).
+
+    Plain tkinter.Canvas rather than a matplotlib Figure -- this is meant
+    to be instantiated once per row in a list of recent recordings, where
+    a full Figure/FigureCanvasTkAgg per row would be far too heavy for
+    what's a handful of pixels of line.
+    """
+    canvas = tk.Canvas(parent, width=width, height=height,
+                       bg=bg or CARD, highlightthickness=0)
+    if values is None:
+        return canvas
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if len(vals) < 2:
+        return canvas
+    if len(vals) > 200:   # ~90px wide -- no need to plot more points than that
+        idx = np.linspace(0, len(vals) - 1, 200).astype(int)
+        vals = vals[idx]
+    lo, hi = float(vals.min()), float(vals.max())
+    span = (hi - lo) or 1.0
+    pad = 3
+    xs = np.linspace(pad, width - pad, len(vals))
+    ys = height - pad - (vals - lo) / span * (height - 2 * pad)
+    canvas.create_line(*(c for xy in zip(xs, ys) for c in xy),
+                       fill=color, width=1.4, smooth=True)
+    return canvas

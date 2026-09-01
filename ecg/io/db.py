@@ -19,6 +19,7 @@ Schema (single table):
         notes       TEXT    DEFAULT '',   -- free-text experiment notes
         session_path TEXT,               -- path to JSON sidecar payload
         verified_for_training INTEGER DEFAULT 0,  -- 1 = usable as ML training data
+        project_name TEXT    DEFAULT '', -- user-entered cohort/study label
     )
 
 The registry lives at SESSION_DIR / "ecg_registry.db".
@@ -58,7 +59,8 @@ CREATE TABLE IF NOT EXISTS recordings (
     rmssd        REAL,
     notes        TEXT    NOT NULL DEFAULT '',
     session_path TEXT    NOT NULL DEFAULT '',
-    verified_for_training INTEGER NOT NULL DEFAULT 0
+    verified_for_training INTEGER NOT NULL DEFAULT 0,
+    project_name TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_fp ON recordings(filepath);
 CREATE INDEX IF NOT EXISTS idx_saved ON recordings(saved_at DESC);
@@ -86,6 +88,12 @@ def _conn() -> sqlite3.Connection:
             con.execute(
                 "ALTER TABLE recordings ADD COLUMN verified_for_training "
                 "INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            con.execute(
+                "ALTER TABLE recordings ADD COLUMN project_name "
+                "TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
         con.commit()
@@ -123,6 +131,7 @@ def upsert_recording(
     stats: "Optional[dict[str, Any]]" = None,
     notes: str = "",
     verified_for_training: bool = False,
+    project_name: str = "",
 ) -> None:
     """Insert or update a recording row with optional stats summary.
 
@@ -149,8 +158,9 @@ def upsert_recording(
             con.execute("""
                 INSERT INTO recordings
                     (filepath, stem, fingerprint, saved_at, duration_s, n_peaks,
-                     hr_mean, sdnn, rmssd, notes, session_path, verified_for_training)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                     hr_mean, sdnn, rmssd, notes, session_path, verified_for_training,
+                     project_name)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(filepath) DO UPDATE SET
                     fingerprint  = excluded.fingerprint,
                     saved_at     = excluded.saved_at,
@@ -161,11 +171,13 @@ def upsert_recording(
                     rmssd        = excluded.rmssd,
                     session_path = excluded.session_path,
                     notes        = excluded.notes,
-                    verified_for_training = excluded.verified_for_training
+                    verified_for_training = excluded.verified_for_training,
+                    project_name = excluded.project_name
             """, (filepath, stem, fingerprint, now,
                   s.get("duration_s"), s.get("n_peaks"),
                   s.get("hr_mean"), s.get("sdnn"), s.get("rmssd"),
-                  notes, session_path, int(verified_for_training)))
+                  notes, session_path, int(verified_for_training),
+                  project_name))
     except Exception as exc:
         log.warning("db.upsert_recording failed: %s", exc)
 
