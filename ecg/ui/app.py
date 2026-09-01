@@ -72,7 +72,7 @@ from ecg.ui.analysis_controller import AnalysisController
 
 # ── ecg.io ────────────────────────────────────────────────────────────────────
 from ecg.io.loaders import list_channels
-from ecg.io.session import load_session
+from ecg.io.session import load_session, load_rr_series
 from ecg.io.db import (
     _DB_AVAILABLE, get_notes, set_notes,
     recent_recordings,
@@ -97,7 +97,7 @@ from ecg.ui.theme import (
     FONT_SIDEBAR_HDR,
     FONT_MICRO, FONT_HINT, FONT_BADGE, FONT_SUBSECTION, FONT_CARD_TITLE,
 )
-from ecg.ui.widgets import make_stat_tile, make_quality_gauge
+from ecg.ui.widgets import make_stat_tile, make_quality_gauge, make_sparkline
 from ecg.ui.plots import CanvasSlot, style_axes
 from ecg.ui.dialogs import (
     ThemeDialog, ArtifactReviewDialog,
@@ -4390,6 +4390,10 @@ class ECGApp(ctk.CTk):
         hdr.pack(fill="x")
         ctk.CTkLabel(hdr, text="Recent recordings", font=FONT_CARD_TITLE,
                      text_color=TEXT, anchor="w").pack(side="left", padx=SPACE_L, pady=SPACE_M)
+        ctk.CTkButton(hdr, text="📈 Cohort Trends", height=28, corner_radius=6,
+                      fg_color=BORDER, hover_color=BORDER2, text_color=TEXT,
+                      font=FONT_BTN_SEC, command=self._open_cohort_trends
+                      ).pack(side="right", padx=SPACE_L, pady=SPACE_M)
 
         scroll = ctk.CTkScrollableFrame(win, fg_color=PANEL)
         scroll.pack(fill="both", expand=True, padx=SPACE_M, pady=SPACE_M)
@@ -4409,6 +4413,8 @@ class ECGApp(ctk.CTk):
                           ).pack(side="left", fill="x", expand=True)
             ctk.CTkLabel(top, text=f"HR {hr}  SDNN {sdnn}  {dur}",
                          font=FONT_KPI_LABEL, text_color=MUTED).pack(side="right")
+            make_sparkline(top, load_rr_series(path), width=80, height=22,
+                           color=BLUE).pack(side="right", padx=(0, 10))
             if notes:
                 ctk.CTkLabel(card, text=f"📝 {notes[:90]}",
                              font=FONT_KPI_LABEL, text_color=LIGHT,
@@ -4425,6 +4431,16 @@ class ECGApp(ctk.CTk):
         for p in extra:
             _entry(p)
 
+    def _open_cohort_trends(self) -> None:
+        """Open the cross-recording HR/SDNN/RMSSD trend view.
+
+        Unlike the Recent-recordings popup (capped at 20, most-recent-
+        first), this pulls the whole registry -- a cohort view is only
+        useful if it isn't quietly dropping older recordings.
+        """
+        from ecg.ui.dialogs import CohortTrendsDialog
+        rows = recent_recordings(limit=500) if _DB_AVAILABLE else []
+        CohortTrendsDialog(self, rows)
 
 
     def _load_path(self, path: str) -> None:

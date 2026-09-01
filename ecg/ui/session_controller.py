@@ -546,15 +546,18 @@ class SessionController:
         # attributes out mid-save.
         filepath = self.app.signal.filepath
         filtered = self.app.signal.filtered
+        project_name = (self.app.ent_project_name.get().strip()
+                         if self.app.ent_project_name is not None else "")
 
         self.app._start_async(
             self.app.btn_save_session, "Saving…", "Saving session…",
-            lambda: self.save_session_worker(state, filepath, filtered),
+            lambda: self.save_session_worker(state, filepath, filtered, project_name),
             self.on_save_session_done,
             pass_result=True,
         )
 
-    def save_session_worker(self, state: dict, filepath: str, filtered: np.ndarray) -> dict:
+    def save_session_worker(self, state: dict, filepath: str, filtered: np.ndarray,
+                             project_name: str = "") -> dict:
         """Background worker for save_session -- MUST NOT touch Tkinter widgets."""
         def _prog(pct: int, msg: str) -> None:
             self.app.after(0, lambda p=pct, m=msg: self.app._set_progress(p, m))
@@ -571,7 +574,11 @@ class SessionController:
             _stats: dict = {}
             if self.app.analysis.results:
                 _rdf = self.app.analysis.results.get("rr_df")
-                _hrv = self.app.analysis.results.get("hrv_td")
+                # "hrv_time" is the results key used everywhere else in the
+                # app (plot_controller.py, export_controller.py) -- this
+                # site read the nonexistent "hrv_td" instead, so sdnn/rmssd
+                # were silently never written to the registry.
+                _hrv = self.app.analysis.results.get("hrv_time")
                 if _rdf is not None and len(_rdf):
                     _stats["hr_mean"] = float(_rdf["HR_bpm"].mean())
                 if _hrv is not None and "HRV_SDNN" in _hrv.columns:
@@ -589,6 +596,7 @@ class SessionController:
                 stats=_stats,
                 notes=self.app.session.recording_notes,
                 verified_for_training=self.app.session.verified_for_training,
+                project_name=project_name,
             )
 
         # ── ML training-data cache ─────────────────────────────────────

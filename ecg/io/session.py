@@ -192,6 +192,28 @@ def load_session(filepath: str) -> "Optional[dict]":
         return None
 
 
+def load_rr_series(filepath: str) -> "Optional[np.ndarray]":
+    """Return the cached RR-interval series (ms, one value per beat) for
+    *filepath*, or None if no session is cached or it has no results.
+
+    Reads the same sidecar save_session()/load_session() use -- built for
+    lightweight previews (e.g. a recent-files sparkline) that need a beat
+    series without re-running detection or touching the raw recording.
+    """
+    state = load_session(filepath)
+    if not state:
+        return None
+    results_raw = state.get("results")
+    if not results_raw:
+        return None
+    from ecg.io.loaders import _deserialise_results
+    results = _deserialise_results(results_raw)
+    rr_df = results.get("rr_df")
+    if rr_df is None or "RR_ms" not in getattr(rr_df, "columns", []):
+        return None
+    return rr_df["RR_ms"].to_numpy()
+
+
 def delete_session(filepath: str) -> bool:
     """Delete any cached session for *filepath*.  Returns True if deleted."""
     sp = _session_path(filepath)
